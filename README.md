@@ -1,3 +1,331 @@
 # SecureVision-AI
 SecureVision AI detects danger in real time using video, audio, and sensors, sending instant emergency alerts with location and evidence. It protects users from assaults, falls, intrusions, and accidents, acting as a 24/7 intelligent safety companion for social good.
+from flask import Flask, Response, render_template_string, jsonify
+import threading
+import time
+import cv2
+import datetime
+
+
+from twilio.rest import Client
+
+TWILIO_ACCOUNT_SID = "ACa6afe62595173f1580056f68d8c643db"
+TWILIO_AUTH_TOKEN = "USef14d74e359426efbc362a71de6ac0c9"
+TWILIO_FROM_NUMBER = "+917447722585"   # Twilio phone number
+ALERT_TO_NUMBER = "+917447722585"     # Your mobile number (with country code)
+
+ALERT_COOLDOWN_SECONDS = 60  # don’t spam SMS, wait this many seconds between alerts
+
+
+
+class SafetyAgent:
+    """
+    Simple AI-style agent:
+    - SENSE: receives camera frames
+    - THINK: detects motion, computes risk
+    - ACT: annotates frame + sends mobile alert when risk detected
+    """
+
+    def __init__(self, cooldown_seconds=60):
+        self.cooldown_seconds = cooldown_seconds
+
+        # Shared state
+        self.latest_frame = None          # JPEG bytes
+        self.risk_active = False
+        self.last_risk_time = None
+        self.last_alert_time = None
+
+        # For motion detection
+        self.prev_gray = None
+
+        # Lock for thread safety
+        self.lock = threading.Lock()
+
+    # --------- ACTION: send alert to mobile ---------
+    def _send_mobile_alert(self, message: str):
+        try:
+            client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+            sms = client.messages.create(
+                body=message,
+                from_=TWILIO_FROM_NUMBER,
+                to=ALERT_TO_NUMBER
+            )
+            print("[AGENT] SMS sent, SID:", sms.sid)
+        except Exception as e:
+            print("[AGENT] ERROR sending SMS:", e)
+
+    # --------- THINK: decide risk from motion ---------
+    def _compute_risk_from_motion(self, gray, frame_delta):
+        """
+        Very simple rule: if there is large motion area -> risk = True
+        You can replace this later with ML model (weapon/fight detection, etc.)
+        """
+        thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
+        thresh = cv2.dilate(thresh, None, iterations=2)
+
+        contours, _ = cv2.findContours(
+            thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        motion_areas = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < 5000:  # ignore small noise
+                continue
+            motion_areas.append((c, area))
+
+        # Risk score: based on total motion area
+        total_area = sum(a for _, a in motion_areas)
+        risk_score = min(1.0, total_area / 50000.0)  # 0.0 to 1.0 approx
+        risk_flag = risk_score > 0.1  # simple threshold
+
+        return risk_flag, risk_score, motion_areas
+
+    # --------- SENSE + THINK + ACT: main entry for each frame ---------
+    def process_frame(self, frame):
+        """
+        Called by camera loop for each frame.
+        - Converts to gray, detects motion, decides risk
+        - Annotates frame and stores JPEG in latest_frame
+        - Sends SMS if needed
+        """
+        # Resize for speed
+        frame = cv2.resize(frame, (640, 480))
+
+        # Grayscale + blur
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (21, 21), 0)
+
+        with self.lock:
+            if self.prev_gray is None:
+                self.prev_gray = gray
+                # Just show normal for first frame
+                self._annotate_and_store(frame, risk=False, risk_score=0.0)
+                return
+
+            # Frame difference
+            frame_delta = cv2.absdiff(self.prev_gray, gray)
+
+            # Decide risk from motion
+            risk_flag, risk_score, motion_areas = self._compute_risk_from_motion(
+                gray, frame_delta
+            )
+
+            # Draw motion boxes
+            for c, _ in motion_areas:
+                (x, y, w, h) = cv2.boundingRect(c)
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
+
+            # Update agent risk state
+            previous_risk = self.risk_active
+            now = datetime.datetime.now()
+
+            if risk_flag:
+                self.risk_active = True
+                self.last_risk_time = now
+            else:
+                self.risk_active = False
+
+            # If risk just turned ON -> consider sending SMS
+            if self.risk_active and not previous_risk:
+                ok_to_send = False
+                if self.last_alert_time is None:
+                    ok_to_send = True
+                else:
+                    delta = (now - self.last_alert_time).total_seconds()
+                    if delta > self.cooldown_seconds:
+                        ok_to_send = True
+
+                if ok_to_send:
+                    self.last_alert_time = now
+                    msg_time = now.strftime("%Y-%m-%d %H:%M:%S")
+                    alert_msg = f"⚠ Camera risk detected at {msg_time}"
+                    print("[AGENT] ", alert_msg)
+                    self._send_mobile_alert(alert_msg)
+                else:
+                    print("[AGENT] Risk detected but in cooldown.")
+
+            # Store frame + update prev_gray
+            self._annotate_and_store(frame, risk=self.risk_active, risk_score=risk_score)
+            self.prev_gray = gray
+
+    def _annotate_and_store(self, frame, risk: bool, risk_score: float):
+        """
+        Draws status text on frame and stores JPEG bytes.
+        """
+        status_text = "RISK DETECTED" if risk else "NORMAL"
+        color = (0, 0, 255) if risk else (0, 255, 0)
+
+        cv2.putText(frame, status_text, (10, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
+
+        cv2.putText(frame, f"Risk score: {risk_score:.2f}", (10, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        if self.last_risk_time:
+            cv2.putText(
+                frame,
+                "Last risk: " + self.last_risk_time.strftime("%H:%M:%S"),
+                (10, 120),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2
+            )
+
+        ret_jpg, jpeg = cv2.imencode(".jpg", frame)
+        if ret_jpg:
+            self.latest_frame = jpeg.tobytes()
+
+    # --------- APIs for web layer ---------
+
+    def get_latest_frame(self):
+        """
+        Returns last JPEG frame bytes (may be None).
+        """
+        with self.lock:
+            return self.latest_frame
+
+    def get_status(self):
+        """
+        Returns dict status for JSON API.
+        """
+        with self.lock:
+            return {
+                "risk_active": self.risk_active,
+                "last_risk_time": self.last_risk_time.isoformat()
+                if self.last_risk_time else None
+            }
+
+
+
+
+agent = SafetyAgent(cooldown_seconds=ALERT_COOLDOWN_SECONDS)
+
+
+def camera_loop():
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: Could not open camera.")
+        return
+
+    print("[SYSTEM] Camera loop started.")
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("[SYSTEM] Failed to grab frame.")
+            time.sleep(0.1)
+            continue
+
+        # Send frame to AI agent
+        agent.process_frame(frame)
+        time.sleep(0.03)  # ~30fps
+
+    cap.release()
+
+
+
+app = Flask(__name__)
+
+HTML_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <title>AI Safety Agent - Camera Monitor</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    h1 { margin-bottom: 0.3em; }
+    .status-ok { color: green; font-weight: bold; }
+    .status-risk { color: red; font-weight: bold; }
+    .info-box {
+        margin-top: 10px;
+        padding: 10px;
+        border: 1px solid #ccc;
+        display: inline-block;
+    }
+  </style>
+  <script>
+    async function refreshStatus() {
+      try {
+        const res = await fetch('/status');
+        const data = await res.json();
+        const statusElem = document.getElementById('status-text');
+        const timeElem = document.getElementById('status-time');
+
+        if (data.risk_active) {
+          statusElem.textContent = "RISK DETECTED";
+          statusElem.className = "status-risk";
+        } else {
+          statusElem.textContent = "NORMAL";
+          statusElem.className = "status-ok";
+        }
+
+        timeElem.textContent = data.last_risk_time || "No risk yet";
+      } catch (e) {
+        console.log("Error fetching status:", e);
+      }
+    }
+
+    setInterval(refreshStatus, 3000);
+    window.onload = refreshStatus;
+  </script>
+</head>
+<body>
+  <h1>AI Safety Agent - Camera Monitor</h1>
+
+  <div>
+    <img src="/video_feed" width="640" height="480">
+  </div>
+
+  <div class="info-box">
+    <div>Current status:
+      <span id="status-text" class="status-ok">Loading...</span>
+    </div>
+    <div>Last risk time:
+      <span id="status-time">Loading...</span>
+    </div>
+    <div>Agent:
+      <span>Observes camera, calculates motion-based risk, sends SMS alerts.</span>
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+
+@app.route("/")
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+
+@app.route("/video_feed")
+def video_feed():
+    def gen():
+        while True:
+            frame = agent.get_latest_frame()
+            if frame is not None:
+                yield (b"--frame\r\n"
+                       b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+            time.sleep(0.03)
+
+    return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.route("/status")
+def status():
+    return jsonify(agent.get_status())
+
+
+# ==========================
+# MAIN
+# ==========================
+
+if __name__ == "__main__":
+    # Start camera sensor loop as background thread
+    cam_thread = threading.Thread(target=camera_loop, daemon=True)
+    cam_thread.start()
+
+    print("[SYSTEM] Starting Flask server at http://127.0.0.1:5000")
+    app.run(host="0.0.0.0", port=5000, debug=False)
+
 
